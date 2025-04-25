@@ -1,25 +1,199 @@
-{
-  "name": "webc",
-  "version": "1.0.0",
-  "description": "GenieACS Client Portal with WhatsApp Bot",
-  "main": "app.js",
-  "scripts": {
-    "start": "node app.js",
-    "dev": "nodemon app.js"
-  },
-  "dependencies": {
-    "@adiwajshing/baileys": "^5.0.0",
-    "@hapi/boom": "^10.0.0",
-    "axios": "^1.6.2",
-    "dotenv": "^16.3.1",
-    "ejs": "^3.1.9",
-    "express": "^4.18.2",
-    "express-session": "^1.17.3",
-    "qrcode-terminal": "^0.12.0",
-    "ws": "^8.13.0",
-    "qrcode": "^1.5.3"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.1"
-  }
+// Import WhatsApp bot dependencies
+const WhatsAppBot = require('./whatsapp/bot');
+const WebSocket = require('ws');
+const { createServer } = require('http');
+
+// Create HTTP server from Express app
+const server = createServer(app);
+const wss = new WebSocket.Server({ server });
+const wsClients = new Map();
+
+// WebSocket connection handler
+wss.on('connection', (ws) => {
+    const id = Date.now();
+    wsClients.set(id, ws);
+    
+    ws.on('close', () => {
+        wsClients.delete(id);
+    });
+});
+
+// Route untuk WhatsApp Settings
+app.get('/admin/whatsapp-settings', async (req, res) => {
+    if (!req.session.isAdmin) {
+        return res.redirect('/admin/login');
+    }
+
+    try {
+        const settings = JSON.parse(fs.readFileSync(SETTINGS_FILE));
+        res.render('admin-settings', { 
+            settings,
+            error: null,
+            success: null
+        });
+    } catch (error) {
+        console.error('Error loading WhatsApp settings:', error);
+        res.render('admin-settings', { 
+            settings: {},
+            error: 'Gagal memuat pengaturan WhatsApp',
+            success: null
+        });
+    }
+});
+
+// Route untuk menghubungkan WhatsApp
+app.post('/admin/whatsapp/connect', async (req, res) => {
+    if (!req.session.isAdmin) {
+        return res.status(403).json({ success: false, message: 'Tidak diizinkan' });
+    }
+
+    try {
+        await WhatsAppBot.initialize(wsClients);
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Error connecting WhatsApp:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Gagal menghubungkan WhatsApp: ' + error.message 
+        });
+    }
+});
+
+// Route untuk memutuskan WhatsApp
+app.post('/admin/whatsapp/disconnect', async (req, res) => {
+    if (!req.session.isAdmin) {
+        return res.status(403).json({ success: false, message: 'Tidak diizinkan' });
+    }
+
+    try {
+        await WhatsAppBot.disconnect();
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Error disconnecting WhatsApp:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Gagal memutuskan WhatsApp: ' + error.message 
+        });
+    }
+});
+
+// Menambahkan handler untuk perintah WhatsApp
+app.post('/whatsapp/command', async (req, res) => {
+    try {
+        const { sender, command, args } = req.body;
+        
+        // Validasi sender (nomor WhatsApp)
+        if (!sender.match(/^\d+@s\.whatsapp\.net$/)) {
+            return res.status(400).json({ 
+                success: false, 
+                message: 'Format nomor WhatsApp tidak valid' 
+            });
+        }
+
+        // Handle perintah
+        switch (command) {
+            case 'status':
+                await handleStatusCommand(sender, args);
+                break;
+            case 'ssid2g':
+                await handleSsid2gCommand(sender, args);
+                break;
+            case 'ssid5g':
+                await handleSsid5gCommand(sender, args);
+                break;
+            case 'pass2g':
+                await handlePass2gCommand(sender, args);
+                break;
+            case 'pass5g':
+                await handlePass5gCommand(sender, args);
+                break;
+            case 'devices':
+                await handleDevicesCommand(sender);
+                break;
+            case 'userinfo':
+                await handleUserInfoCommand(sender);
+                break;
+            default:
+                return res.status(400).json({ 
+                    success: false, 
+                    message: 'Perintah tidak dikenal' 
+                });
+        }
+
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Error handling WhatsApp command:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Gagal memproses perintah: ' + error.message 
+        });
+    }
+});
+
+// Ganti app.listen dengan server.listen
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`Server berjalan di port ${PORT}`);
+});
+
+// Command handlers untuk WhatsApp
+async function handleStatusCommand(sender, args) {
+    try {
+        const customerNumber = sender.split('@')[0];
+        const device = await getDeviceByNumber(customerNumber);
+        
+        if (!device) {
+            await WhatsAppBot.sendMessage(sender, 
+                '❌ Perangkat tidak ditemukan untuk nomor ini');
+            return;
+        }
+
+        const status = `───「 *Neon.ID* 」───╮
+│ ${getFormattedDate()}
+╰────────────────╯
+
+*Status Perangkat*
+┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+📡 Model: ${device.model}
+📶 Status: ${device.status ? 'Online ✅' : 'Offline ❌'}
+📊 RX Power: ${device.rxPower || 'N/A'}
+🔄 Uptime: ${formatUptime(device.uptime)}
+📱 Connected: ${device.connectedDevices || '0'}
+
+SSID 2.4G: ${device.ssid2G || 'N/A'}
+SSID 5G: ${device.ssid5G || 'N/A'}
+┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+_Neon.ID_`;
+
+        await WhatsAppBot.sendMessage(sender, { text: status });
+    } catch (error) {
+        console.error('Error handling status command:', error);
+        await WhatsAppBot.sendMessage(sender, 
+            '❌ Terjadi kesalahan saat mengambil status perangkat');
+    }
+}
+
+// Tambahkan handler untuk perintah lainnya sesuai kebutuhan
+async function handleSsid2gCommand(sender, args) {
+    // Implementasi fungsi untuk mengubah SSID 2.4G
+}
+
+async function handleSsid5gCommand(sender, args) {
+    // Implementasi fungsi untuk mengubah SSID 5G
+}
+
+async function handlePass2gCommand(sender, args) {
+    // Implementasi fungsi untuk mengubah password 2.4G
+}
+
+async function handlePass5gCommand(sender, args) {
+    // Implementasi fungsi untuk mengubah password 5G
+}
+
+async function handleDevicesCommand(sender) {
+    // Implementasi fungsi untuk melihat perangkat terhubung
+}
+
+async function handleUserInfoCommand(sender) {
+    // Implementasi fungsi untuk melihat info pelanggan
 }
